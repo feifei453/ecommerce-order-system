@@ -2,7 +2,7 @@
 
 一个围绕电商订单主链路进行强化的 Java 后端项目，覆盖订单创建、库存锁定、支付回调、超时取消、发货、收货、售后审核以及客服 Agent 查询。
 
-本仓库基于 [macrozheng/mall](https://github.com/macrozheng/mall) 的 `dev-v2` 分支进行学习型二次开发。基础商城模块来自上游项目，本仓库重点展示订单交易链路的改造过程和新增功能，不将上游代码宣称为个人原创。
+项目采用成熟的电商基础架构，重点实现订单交易链路的业务约束、可靠性设计和智能客服系统联动。
 
 ## 项目要解决的问题
 
@@ -43,7 +43,7 @@ flowchart LR
 | MongoDB | 浏览记录等非核心数据 | 27018 |
 | MinIO | 本地对象存储 | 9091 / 9002 |
 
-## 本仓库的二次开发
+## 核心实现
 
 ### 1. 订单状态机
 
@@ -214,8 +214,6 @@ java -jar mall-portal\target\mall-portal-1.0-SNAPSHOT.jar --spring.profiles.acti
 - 防重复提交解决短时间相同请求重复进入，不等同于完整的分布式事务方案。
 - 目前以功能链路验证为主，没有宣称未经压测的数据或并发指标。
 
-## 上游与许可
+## 开源致谢与许可
 
-基础项目来源：[macrozheng/mall](https://github.com/macrozheng/mall)。
-
-仓库保留上游 Git 历史，便于区分基础代码与本次二次开发提交。本项目继续遵循上游仓库的 Apache License 2.0，详见 [LICENSE](./LICENSE)。
+本项目使用 [macrozheng/mall](https://github.com/macrozheng/mall) 作为基础框架，并在其上完成订单交易可靠性和客服 Agent 接口的功能建设。感谢原作者及开源社区，本项目遵循 Apache License 2.0，详见 [LICENSE](./LICENSE)。
