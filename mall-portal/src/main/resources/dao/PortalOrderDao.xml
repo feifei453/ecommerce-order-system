@@ -111,4 +111,24 @@
             id = #{productSkuId}
           AND lock_stock - #{quantity} &gt;= 0
     </update>
+    <select id="getSkuStockLockStatus" resultType="com.macro.mall.portal.domain.OrderSkuStockLockStatus">
+        SELECT
+            o.id order_id,
+            o.order_sn order_sn,
+            o.status order_status,
+            oi.product_sku_id product_sku_id,
+            oi.product_name product_name,
+            oi.product_quantity product_quantity,
+            sku.stock stock,
+            sku.lock_stock lock_stock,
+            sku.stock - sku.lock_stock available_stock
+        FROM
+            oms_order o
+            INNER JOIN oms_order_item oi ON o.id = oi.order_id
+            INNER JOIN pms_sku_stock sku ON oi.product_sku_id = sku.id
+        WHERE
+            o.id = #{orderId}
+        ORDER BY
+            oi.id ASC
+    </select>
 </mapper>

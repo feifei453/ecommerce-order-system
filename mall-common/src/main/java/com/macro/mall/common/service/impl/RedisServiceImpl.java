@@ -23,6 +23,11 @@ public class RedisServiceImpl implements RedisService {
     }
 
     @Override
+    public Boolean setIfAbsent(String key, Object value, long time) {
+        return redisTemplate.opsForValue().setIfAbsent(key, value, time, TimeUnit.SECONDS);
+    }
+
+    @Override
     public void set(String key, Object value) {
         redisTemplate.opsForValue().set(key, value);
     }

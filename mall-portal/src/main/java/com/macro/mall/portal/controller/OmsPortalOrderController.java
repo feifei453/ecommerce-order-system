@@ -5,6 +5,8 @@ import com.macro.mall.common.api.CommonResult;
 import com.macro.mall.portal.domain.ConfirmOrderResult;
 import com.macro.mall.portal.domain.OmsOrderDetail;
 import com.macro.mall.portal.domain.OrderParam;
+import com.macro.mall.portal.domain.OrderSkuStockLockStatus;
+import com.macro.mall.portal.domain.OrderTimeoutCancelTrace;
 import com.macro.mall.portal.service.OmsPortalOrderService;
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiImplicitParam;
@@ -45,7 +47,7 @@ public class OmsPortalOrderController {
         return CommonResult.success(result, "下单成功");
     }
 
-    @ApiOperation("用户支付成功的回调")
+    @ApiOperation("用户支付成功的回调（幂等：重复回调不会重复扣减库存）")
     @RequestMapping(value = "/paySuccess", method = RequestMethod.POST)
     @ResponseBody
     public CommonResult paySuccess(@RequestParam Long orderId,@RequestParam Integer payType) {
@@ -70,8 +72,8 @@ public class OmsPortalOrderController {
     }
 
     @ApiOperation("按状态分页获取用户订单列表")
-    @ApiImplicitParam(name = "status", value = "订单状态：-1->全部；0->待付款；1->待发货；2->已发货；3->已完成；4->已关闭",
-            defaultValue = "-1", allowableValues = "-1,0,1,2,3,4", paramType = "query", dataType = "int")
+    @ApiImplicitParam(name = "status", value = "订单状态：-1->全部；0->待付款；1->待发货；2->已发货；3->已完成；4->已关闭；5->无效订单",
+            defaultValue = "-1", allowableValues = "-1,0,1,2,3,4,5", paramType = "query", dataType = "int")
     @RequestMapping(value = "/list", method = RequestMethod.GET)
     @ResponseBody
     public CommonResult<CommonPage<OmsOrderDetail>> list(@RequestParam Integer status,
@@ -87,6 +89,31 @@ public class OmsPortalOrderController {
     public CommonResult<OmsOrderDetail> detail(@PathVariable Long orderId) {
         OmsOrderDetail orderDetail = portalOrderService.detail(orderId);
         return CommonResult.success(orderDetail);
+    }
+
+    @ApiOperation("查询订单SKU库存锁定状态")
+    @RequestMapping(value = "/stockLockStatus/{orderId}", method = RequestMethod.GET)
+    @ResponseBody
+    public CommonResult<List<OrderSkuStockLockStatus>> stockLockStatus(@PathVariable Long orderId) {
+        List<OrderSkuStockLockStatus> result = portalOrderService.getStockLockStatus(orderId);
+        return CommonResult.success(result);
+    }
+
+    @ApiOperation("发送订单超时关闭验证消息")
+    @RequestMapping(value = "/timeoutCancel/send", method = RequestMethod.POST)
+    @ResponseBody
+    public CommonResult timeoutCancelSend(@RequestParam Long orderId,
+                                          @RequestParam(required = false, defaultValue = "5000") Long delayTimes) {
+        portalOrderService.sendDelayMessageCancelOrder(orderId, delayTimes);
+        return CommonResult.success(null, "超时关闭延迟消息已发送");
+    }
+
+    @ApiOperation("查询订单超时关闭链路追踪")
+    @RequestMapping(value = "/timeoutCancel/trace/{orderId}", method = RequestMethod.GET)
+    @ResponseBody
+    public CommonResult<OrderTimeoutCancelTrace> timeoutCancelTrace(@PathVariable Long orderId) {
+        OrderTimeoutCancelTrace result = portalOrderService.getTimeoutCancelTrace(orderId);
+        return CommonResult.success(result);
     }
 
     @ApiOperation("用户取消订单")

@@ -16,6 +16,11 @@ public interface RedisService {
     void set(String key, Object value, long time);
 
     /**
+     * 当key不存在时保存属性，用于防重复提交、轻量分布式锁等场景
+     */
+    Boolean setIfAbsent(String key, Object value, long time);
+
+    /**
      * 保存属性
      */
     void set(String key, Object value);

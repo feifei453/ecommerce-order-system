@@ -1,4 +1,46 @@
-# mall
+# 电商订单交易系统
+
+本项目基于开源项目 [`macrozheng/mall`](https://github.com/macrozheng/mall) 的 `dev-v2` 分支进行学习型二次开发，重点强化订单交易主链路，并提供面向 RAG 客服 Agent 的业务工具 API。
+
+## 二次开发内容
+
+- 使用订单状态机约束支付、发货、收货、取消、关闭等状态流转。
+- 使用 Redis `SETNX + TTL` 和请求业务指纹防止订单重复提交。
+- 使用条件更新实现支付回调幂等，避免重复扣减库存。
+- 使用 RabbitMQ 延迟队列实现订单超时关闭，并补充库存释放和操作日志追踪。
+- 增加 SKU 库存锁定状态、订单超时取消链路等验证接口。
+- 增加售后退货审核状态机以及通过、拒绝、完成接口。
+- 提供订单、物流、售后和聚合上下文等客服 Agent 工具 API。
+- 提供本地 Docker Compose 编排，隔离 MySQL、Redis、RabbitMQ、MongoDB 和 MinIO 端口。
+
+## 核心链路
+
+```text
+提交订单 -> Redis 防重 -> 校验库存 -> 锁定库存 -> 创建待付款订单
+         -> RabbitMQ 延迟消息 -> 超时关闭订单 -> 释放锁定库存
+         -> 支付成功回调 -> 条件更新保证幂等 -> 扣减库存 -> 待发货
+```
+
+客服 Agent 联动链路：
+
+```text
+RAG 客服 -> Agent 工具调用 -> /agent-tools/** -> 订单/物流/售后数据 -> 生成客服回答
+```
+
+## 快速开始
+
+- 本地环境搭建与启动：[LOCAL_RUN.md](./LOCAL_RUN.md)
+- 二次开发范围及接口说明：[PROJECT_PLAN.md](./PROJECT_PLAN.md)
+- `mall-admin` Swagger：`http://127.0.0.1:8081/swagger-ui/`
+- `mall-portal` Swagger：`http://127.0.0.1:8085/swagger-ui/`
+
+## 项目说明
+
+仓库保留上游项目的 Git 提交历史和原始文档。上述“二次开发内容”为本仓库新增或改造的部分，其余基础商城功能及版权归原项目作者所有。详细许可条件请参见仓库中的 `LICENSE`。
+
+---
+
+# 上游项目说明：mall
 
 <p>
   <a href="#公众号"><img src="http://macro-oss.oss-cn-shenzhen.aliyuncs.com/mall/badge/%E5%85%AC%E4%BC%97%E5%8F%B7-macrozheng-blue.svg" alt="公众号"></a>

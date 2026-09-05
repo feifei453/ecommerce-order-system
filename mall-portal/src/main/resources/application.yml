@@ -37,6 +37,7 @@ secure:
       - /product/**
       - /brand/**
       - /alipay/**
+      - /agent-tools/**
 
 # 自定义redis key
 redis:
@@ -44,9 +45,11 @@ redis:
   key:
     authCode: 'ums:authCode'
     orderId: 'oms:orderId'
+    orderSubmitLock: 'oms:orderSubmitLock'
     member: 'ums:member'
   expire:
     authCode: 90 # 验证码超期时间
+    orderSubmitLock: 10 # 订单提交防重复锁超期时间
     common: 86400 # 24小时
 
 mongo:
@@ -58,4 +61,3 @@ rabbitmq:
   queue:
     name:
       cancelOrder: cancelOrderQueue
-

@@ -2,6 +2,7 @@ package com.macro.mall.portal.dao;
 
 import com.macro.mall.model.OmsOrderItem;
 import com.macro.mall.portal.domain.OmsOrderDetail;
+import com.macro.mall.portal.domain.OrderSkuStockLockStatus;
 import org.apache.ibatis.annotations.Param;
 
 import java.util.List;
@@ -51,4 +52,9 @@ public interface PortalOrderDao {
      * 根据商品的skuId释放库存
      */
     int releaseStockBySkuId(@Param("productSkuId")Long productSkuId,@Param("quantity") Integer quantity);
+
+    /**
+     * 查询订单商品对应SKU的库存锁定状态
+     */
+    List<OrderSkuStockLockStatus> getSkuStockLockStatus(@Param("orderId") Long orderId);
 }

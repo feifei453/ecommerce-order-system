@@ -4,6 +4,8 @@ import com.macro.mall.common.api.CommonPage;
 import com.macro.mall.portal.domain.ConfirmOrderResult;
 import com.macro.mall.portal.domain.OmsOrderDetail;
 import com.macro.mall.portal.domain.OrderParam;
+import com.macro.mall.portal.domain.OrderSkuStockLockStatus;
+import com.macro.mall.portal.domain.OrderTimeoutCancelTrace;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
@@ -73,4 +75,25 @@ public interface OmsPortalOrderService {
      */
     @Transactional
     void paySuccessByOrderSn(String orderSn, Integer payType);
+
+    /**
+     * 查询订单商品对应SKU库存锁定状态
+     */
+    List<OrderSkuStockLockStatus> getStockLockStatus(Long orderId);
+
+    /**
+     * 发送自定义延迟时间的订单超时关闭验证消息
+     */
+    void sendDelayMessageCancelOrder(Long orderId, Long delayTimes);
+
+    /**
+     * RabbitMQ延迟消息触发的订单超时关闭
+     */
+    @Transactional
+    void cancelOrderByTimeoutMessage(Long orderId);
+
+    /**
+     * 查询订单超时关闭链路追踪信息
+     */
+    OrderTimeoutCancelTrace getTimeoutCancelTrace(Long orderId);
 }

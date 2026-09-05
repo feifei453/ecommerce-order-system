@@ -68,4 +68,40 @@ public class OmsOrderReturnApplyController {
         return CommonResult.failed();
     }
 
+    @ApiOperation("售后审核通过")
+    @RequestMapping(value = "/audit/approve/{id}", method = RequestMethod.POST)
+    @ResponseBody
+    public CommonResult approve(@PathVariable Long id, @RequestBody OmsUpdateStatusParam statusParam) {
+        statusParam.setStatus(1);
+        int count = returnApplyService.updateStatus(id, statusParam);
+        if (count > 0) {
+            return CommonResult.success(count, "售后审核已通过");
+        }
+        return CommonResult.failed();
+    }
+
+    @ApiOperation("售后审核拒绝")
+    @RequestMapping(value = "/audit/reject/{id}", method = RequestMethod.POST)
+    @ResponseBody
+    public CommonResult reject(@PathVariable Long id, @RequestBody OmsUpdateStatusParam statusParam) {
+        statusParam.setStatus(3);
+        int count = returnApplyService.updateStatus(id, statusParam);
+        if (count > 0) {
+            return CommonResult.success(count, "售后审核已拒绝");
+        }
+        return CommonResult.failed();
+    }
+
+    @ApiOperation("确认退货收货完成")
+    @RequestMapping(value = "/audit/complete/{id}", method = RequestMethod.POST)
+    @ResponseBody
+    public CommonResult complete(@PathVariable Long id, @RequestBody OmsUpdateStatusParam statusParam) {
+        statusParam.setStatus(2);
+        int count = returnApplyService.updateStatus(id, statusParam);
+        if (count > 0) {
+            return CommonResult.success(count, "退货收货已完成");
+        }
+        return CommonResult.failed();
+    }
+
 }

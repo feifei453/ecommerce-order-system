@@ -4,6 +4,7 @@ import cn.hutool.core.bean.BeanUtil;
 import cn.hutool.core.collection.CollUtil;
 import com.github.pagehelper.PageHelper;
 import com.macro.mall.common.api.CommonPage;
+import com.macro.mall.common.enums.OrderStatus;
 import com.macro.mall.common.exception.Asserts;
 import com.macro.mall.common.service.RedisService;
 import com.macro.mall.mapper.*;
@@ -22,6 +23,9 @@ import org.springframework.util.CollectionUtils;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -59,12 +63,18 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
     private String REDIS_KEY_ORDER_ID;
     @Value("${redis.database}")
     private String REDIS_DATABASE;
+    @Value("${redis.key.orderSubmitLock:oms:orderSubmitLock}")
+    private String REDIS_KEY_ORDER_SUBMIT_LOCK;
+    @Value("${redis.expire.orderSubmitLock:10}")
+    private Long ORDER_SUBMIT_LOCK_EXPIRE_SECONDS;
     @Autowired
     private PortalOrderDao portalOrderDao;
     @Autowired
     private OmsOrderSettingMapper orderSettingMapper;
     @Autowired
     private OmsOrderItemMapper orderItemMapper;
+    @Autowired
+    private OmsOrderOperateHistoryMapper orderOperateHistoryMapper;
     @Autowired
     private CancelOrderSender cancelOrderSender;
 
@@ -94,13 +104,18 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
 
     @Override
     public Map<String, Object> generateOrder(OrderParam orderParam) {
+        UmsMember currentMember = memberService.getCurrentMember();
+        String submitLockKey = buildOrderSubmitLockKey(currentMember.getId(), orderParam);
+        Boolean locked = redisService.setIfAbsent(submitLockKey, System.currentTimeMillis(), ORDER_SUBMIT_LOCK_EXPIRE_SECONDS);
+        if (!Boolean.TRUE.equals(locked)) {
+            Asserts.fail("订单正在提交，请勿重复操作");
+        }
         List<OmsOrderItem> orderItemList = new ArrayList<>();
         //校验收货地址
         if(orderParam.getMemberReceiveAddressId()==null){
             Asserts.fail("请选择收货地址！");
         }
         //获取购物车及优惠信息
-        UmsMember currentMember = memberService.getCurrentMember();
         List<CartPromotionItem> cartPromotionItemList = cartItemService.listPromotion(currentMember.getId(), orderParam.getCartIds());
         for (CartPromotionItem cartPromotionItem : cartPromotionItemList) {
             //生成下单商品信息
@@ -195,7 +210,7 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         //订单来源：0->PC订单；1->app订单
         order.setSourceType(1);
         //订单状态：0->待付款；1->待发货；2->已发货；3->已完成；4->已关闭；5->无效订单
-        order.setStatus(0);
+        order.setStatus(OrderStatus.PENDING_PAYMENT.getValue());
         //订单类型：0->正常订单；1->秒杀订单
         order.setOrderType(0);
         //收货人信息：姓名、电话、邮编、地址
@@ -224,6 +239,7 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         // TODO: 2018/9/3 bill_*,delivery_*
         //插入order表和order_item表
         orderMapper.insert(order);
+        addOrderOperateHistory(order.getId(), "用户", OrderStatus.PENDING_PAYMENT.getValue(), "提交订单，锁定SKU库存");
         for (OmsOrderItem orderItem : orderItemList) {
             orderItem.setOrderId(order.getId());
             orderItem.setOrderSn(order.getOrderSn());
@@ -253,20 +269,36 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
 
     @Override
     public Integer paySuccess(Long orderId, Integer payType) {
+        OmsOrder currentOrder = orderMapper.selectByPrimaryKey(orderId);
+        if (currentOrder == null || !Integer.valueOf(0).equals(currentOrder.getDeleteStatus())) {
+            Asserts.fail("订单不存在！");
+        }
+        if (OrderStatus.PENDING_DELIVERY.getValue().equals(currentOrder.getStatus())) {
+            log.info("订单{}已完成支付，忽略重复支付回调", currentOrder.getOrderSn());
+            return 0;
+        }
+        if (!OrderStatus.canPay(currentOrder.getStatus())) {
+            Asserts.fail("当前订单状态不允许支付！");
+        }
         //修改订单支付状态
         OmsOrder order = new OmsOrder();
         order.setId(orderId);
-        order.setStatus(1);
+        order.setStatus(OrderStatus.PENDING_DELIVERY.getValue());
         order.setPaymentTime(new Date());
         order.setPayType(payType);
         OmsOrderExample orderExample = new OmsOrderExample();
         orderExample.createCriteria()
                 .andIdEqualTo(order.getId())
                 .andDeleteStatusEqualTo(0)
-                .andStatusEqualTo(0);
+                .andStatusEqualTo(OrderStatus.PENDING_PAYMENT.getValue());
         //只修改未付款状态的订单
         int updateCount = orderMapper.updateByExampleSelective(order, orderExample);
         if(updateCount==0){
+            OmsOrder latestOrder = orderMapper.selectByPrimaryKey(orderId);
+            if (latestOrder != null && OrderStatus.PENDING_DELIVERY.getValue().equals(latestOrder.getStatus())) {
+                log.info("订单{}并发支付回调已被其他请求处理", latestOrder.getOrderSn());
+                return 0;
+            }
             Asserts.fail("订单不存在或订单状态不是未支付！");
         }
         //恢复所有下单商品的锁定库存，扣减真实库存
@@ -279,6 +311,7 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
             }
             totalCount+=count;
         }
+        addOrderOperateHistory(orderId, "支付回调", OrderStatus.PENDING_DELIVERY.getValue(), "支付成功，扣减真实库存并释放锁定库存");
         return totalCount;
     }
 
@@ -296,10 +329,11 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         for (OmsOrderDetail timeOutOrder : timeOutOrders) {
             ids.add(timeOutOrder.getId());
         }
-        portalOrderDao.updateOrderStatus(ids, 4);
+        portalOrderDao.updateOrderStatus(ids, OrderStatus.CLOSED.getValue());
         for (OmsOrderDetail timeOutOrder : timeOutOrders) {
             //解除订单商品库存锁定
             portalOrderDao.releaseSkuStockLock(timeOutOrder.getOrderItemList());
+            addOrderOperateHistory(timeOutOrder.getId(), "系统定时任务", OrderStatus.CLOSED.getValue(), "订单超时未支付，自动关闭并释放锁定库存");
             //修改优惠券使用状态
             updateCouponStatus(timeOutOrder.getCouponId(), timeOutOrder.getMemberId(), 0);
             //返还使用积分
@@ -313,9 +347,18 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
 
     @Override
     public void cancelOrder(Long orderId) {
+        cancelPendingOrder(orderId, "用户", "用户主动取消订单，释放锁定库存");
+    }
+
+    @Override
+    public void cancelOrderByTimeoutMessage(Long orderId) {
+        cancelPendingOrder(orderId, "RabbitMQ延迟消息", "订单超时未支付，MQ触发关闭并释放锁定库存");
+    }
+
+    private void cancelPendingOrder(Long orderId, String operateMan, String note) {
         //查询未付款的取消订单
         OmsOrderExample example = new OmsOrderExample();
-        example.createCriteria().andIdEqualTo(orderId).andStatusEqualTo(0).andDeleteStatusEqualTo(0);
+        example.createCriteria().andIdEqualTo(orderId).andStatusEqualTo(OrderStatus.PENDING_PAYMENT.getValue()).andDeleteStatusEqualTo(0);
         List<OmsOrder> cancelOrderList = orderMapper.selectByExample(example);
         if (CollectionUtils.isEmpty(cancelOrderList)) {
             return;
@@ -323,7 +366,7 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         OmsOrder cancelOrder = cancelOrderList.get(0);
         if (cancelOrder != null) {
             //修改订单状态为取消
-            cancelOrder.setStatus(4);
+            cancelOrder.setStatus(OrderStatus.CLOSED.getValue());
             orderMapper.updateByPrimaryKeySelective(cancelOrder);
             OmsOrderItemExample orderItemExample = new OmsOrderItemExample();
             orderItemExample.createCriteria().andOrderIdEqualTo(orderId);
@@ -337,6 +380,7 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
                     }
                 }
             }
+            addOrderOperateHistory(orderId, operateMan, OrderStatus.CLOSED.getValue(), note);
             //修改优惠券使用状态
             updateCouponStatus(cancelOrder.getCouponId(), cancelOrder.getMemberId(), 0);
             //返还使用积分
@@ -353,7 +397,20 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         OmsOrderSetting orderSetting = orderSettingMapper.selectByPrimaryKey(1L);
         long delayTimes = orderSetting.getNormalOrderOvertime() * 60 * 1000;
         //发送延迟消息
+        sendDelayMessageCancelOrder(orderId, delayTimes);
+    }
+
+    @Override
+    public void sendDelayMessageCancelOrder(Long orderId, Long delayTimes) {
+        OmsOrder order = orderMapper.selectByPrimaryKey(orderId);
+        if (order == null || !Integer.valueOf(0).equals(order.getDeleteStatus())) {
+            Asserts.fail("订单不存在！");
+        }
+        if (!OrderStatus.canCancel(order.getStatus())) {
+            Asserts.fail("只有待付款订单可以发送超时关闭消息！");
+        }
         cancelOrderSender.sendMessage(orderId, delayTimes);
+        addOrderOperateHistory(orderId, "系统", order.getStatus(), "发送订单超时关闭延迟消息，delayTimes=" + delayTimes + "ms");
     }
 
     @Override
@@ -363,13 +420,14 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         if(!member.getId().equals(order.getMemberId())){
             Asserts.fail("不能确认他人订单！");
         }
-        if(order.getStatus()!=2){
+        if(!OrderStatus.canConfirmReceive(order.getStatus())){
             Asserts.fail("该订单还未发货！");
         }
-        order.setStatus(3);
+        order.setStatus(OrderStatus.COMPLETED.getValue());
         order.setConfirmStatus(1);
         order.setReceiveTime(new Date());
         orderMapper.updateByPrimaryKey(order);
+        addOrderOperateHistory(orderId, "用户", OrderStatus.COMPLETED.getValue(), "用户确认收货，订单完成");
     }
 
     @Override
@@ -434,7 +492,7 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         if(!member.getId().equals(order.getMemberId())){
             Asserts.fail("不能删除他人订单！");
         }
-        if(order.getStatus()==3||order.getStatus()==4){
+        if(OrderStatus.canDelete(order.getStatus())){
             order.setDeleteStatus(1);
             orderMapper.updateByPrimaryKey(order);
         }else{
@@ -447,13 +505,52 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         OmsOrderExample example =  new OmsOrderExample();
         example.createCriteria()
                 .andOrderSnEqualTo(orderSn)
-                .andStatusEqualTo(0)
                 .andDeleteStatusEqualTo(0);
         List<OmsOrder> orderList = orderMapper.selectByExample(example);
         if(CollUtil.isNotEmpty(orderList)){
             OmsOrder order = orderList.get(0);
             paySuccess(order.getId(),payType);
         }
+    }
+
+    @Override
+    public List<OrderSkuStockLockStatus> getStockLockStatus(Long orderId) {
+        UmsMember member = memberService.getCurrentMember();
+        OmsOrder order = orderMapper.selectByPrimaryKey(orderId);
+        if (order == null || !Integer.valueOf(0).equals(order.getDeleteStatus())) {
+            Asserts.fail("订单不存在！");
+        }
+        if (!member.getId().equals(order.getMemberId())) {
+            Asserts.fail("不能查询他人订单！");
+        }
+        return portalOrderDao.getSkuStockLockStatus(orderId);
+    }
+
+    @Override
+    public OrderTimeoutCancelTrace getTimeoutCancelTrace(Long orderId) {
+        UmsMember member = memberService.getCurrentMember();
+        OmsOrder order = orderMapper.selectByPrimaryKey(orderId);
+        if (order == null || !Integer.valueOf(0).equals(order.getDeleteStatus())) {
+            Asserts.fail("订单不存在！");
+        }
+        if (!member.getId().equals(order.getMemberId())) {
+            Asserts.fail("不能查询他人订单！");
+        }
+        OrderTimeoutCancelTrace trace = new OrderTimeoutCancelTrace();
+        trace.setOrderId(order.getId());
+        trace.setOrderSn(order.getOrderSn());
+        trace.setOrderStatus(order.getStatus());
+        trace.setQueueName(QueueEnum.QUEUE_ORDER_CANCEL.getName());
+        trace.setTtlQueueName(QueueEnum.QUEUE_TTL_ORDER_CANCEL.getName());
+        trace.setExchange(QueueEnum.QUEUE_ORDER_CANCEL.getExchange());
+        trace.setTtlExchange(QueueEnum.QUEUE_TTL_ORDER_CANCEL.getExchange());
+        trace.setStockLockStatusList(portalOrderDao.getSkuStockLockStatus(orderId));
+
+        OmsOrderOperateHistoryExample historyExample = new OmsOrderOperateHistoryExample();
+        historyExample.createCriteria().andOrderIdEqualTo(orderId);
+        historyExample.setOrderByClause("create_time desc");
+        trace.setHistoryList(orderOperateHistoryMapper.selectByExample(historyExample));
+        return trace;
     }
 
     /**
@@ -474,6 +571,42 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
             sb.append(incrementStr);
         }
         return sb.toString();
+    }
+
+    private String buildOrderSubmitLockKey(Long memberId, OrderParam orderParam) {
+        List<Long> cartIds = orderParam.getCartIds() == null ? new ArrayList<>() : new ArrayList<>(orderParam.getCartIds());
+        Collections.sort(cartIds);
+        String raw = memberId + "|"
+                + orderParam.getMemberReceiveAddressId() + "|"
+                + orderParam.getCouponId() + "|"
+                + orderParam.getUseIntegration() + "|"
+                + orderParam.getPayType() + "|"
+                + cartIds;
+        return REDIS_DATABASE + ":" + REDIS_KEY_ORDER_SUBMIT_LOCK + ":" + memberId + ":" + sha256(raw);
+    }
+
+    private String sha256(String raw) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] bytes = digest.digest(raw.getBytes(StandardCharsets.UTF_8));
+            StringBuilder builder = new StringBuilder();
+            for (byte b : bytes) {
+                builder.append(String.format("%02x", b));
+            }
+            return builder.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 algorithm unavailable", e);
+        }
+    }
+
+    private void addOrderOperateHistory(Long orderId, String operateMan, Integer orderStatus, String note) {
+        OmsOrderOperateHistory history = new OmsOrderOperateHistory();
+        history.setOrderId(orderId);
+        history.setOperateMan(operateMan);
+        history.setCreateTime(new Date());
+        history.setOrderStatus(orderStatus);
+        history.setNote(note);
+        orderOperateHistoryMapper.insert(history);
     }
 
     /**

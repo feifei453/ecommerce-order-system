@@ -20,7 +20,7 @@ public class CancelOrderReceiver {
     private OmsPortalOrderService portalOrderService;
     @RabbitHandler
     public void handle(Long orderId){
-        portalOrderService.cancelOrder(orderId);
+        portalOrderService.cancelOrderByTimeoutMessage(orderId);
         LOGGER.info("process orderId:{}",orderId);
     }
 }

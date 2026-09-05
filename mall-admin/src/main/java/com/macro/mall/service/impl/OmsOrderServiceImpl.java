@@ -1,6 +1,7 @@
 package com.macro.mall.service.impl;
 
 import com.github.pagehelper.PageHelper;
+import com.macro.mall.common.enums.OrderStatus;
 import com.macro.mall.dao.OmsOrderDao;
 import com.macro.mall.dao.OmsOrderOperateHistoryDao;
 import com.macro.mall.dto.*;
@@ -15,6 +16,7 @@ import org.springframework.stereotype.Service;
 
 import java.util.Date;
 import java.util.List;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
@@ -40,16 +42,29 @@ public class OmsOrderServiceImpl implements OmsOrderService {
 
     @Override
     public int delivery(List<OmsOrderDeliveryParam> deliveryParamList) {
+        if (deliveryParamList == null || deliveryParamList.isEmpty()) {
+            return 0;
+        }
+        List<Long> orderIds = deliveryParamList.stream()
+                .map(OmsOrderDeliveryParam::getOrderId)
+                .collect(Collectors.toList());
+        Set<Long> deliverableOrderIds = selectOrderIdsByStatus(orderIds, OrderStatus.PENDING_DELIVERY.getValue());
+        List<OmsOrderDeliveryParam> deliverableParamList = deliveryParamList.stream()
+                .filter(item -> deliverableOrderIds.contains(item.getOrderId()))
+                .collect(Collectors.toList());
+        if (deliverableParamList.isEmpty()) {
+            return 0;
+        }
         //批量发货
-        int count = orderDao.delivery(deliveryParamList);
+        int count = orderDao.delivery(deliverableParamList);
         //添加操作记录
-        List<OmsOrderOperateHistory> operateHistoryList = deliveryParamList.stream()
+        List<OmsOrderOperateHistory> operateHistoryList = deliverableParamList.stream()
                 .map(omsOrderDeliveryParam -> {
                     OmsOrderOperateHistory history = new OmsOrderOperateHistory();
                     history.setOrderId(omsOrderDeliveryParam.getOrderId());
                     history.setCreateTime(new Date());
                     history.setOperateMan("后台管理员");
-                    history.setOrderStatus(2);
+                    history.setOrderStatus(OrderStatus.DELIVERED.getValue());
                     history.setNote("完成发货");
                     return history;
                 }).collect(Collectors.toList());
@@ -59,21 +74,36 @@ public class OmsOrderServiceImpl implements OmsOrderService {
 
     @Override
     public int close(List<Long> ids, String note) {
+        if (ids == null || ids.isEmpty()) {
+            return 0;
+        }
+        Set<Long> closableOrderIds = selectOrderIdsByStatus(ids, OrderStatus.PENDING_PAYMENT.getValue());
+        if (closableOrderIds.isEmpty()) {
+            return 0;
+        }
         OmsOrder record = new OmsOrder();
-        record.setStatus(4);
+        record.setStatus(OrderStatus.CLOSED.getValue());
         OmsOrderExample example = new OmsOrderExample();
-        example.createCriteria().andDeleteStatusEqualTo(0).andIdIn(ids);
+        example.createCriteria()
+                .andDeleteStatusEqualTo(0)
+                .andIdIn(new java.util.ArrayList<>(closableOrderIds))
+                .andStatusEqualTo(OrderStatus.PENDING_PAYMENT.getValue());
         int count = orderMapper.updateByExampleSelective(record, example);
-        List<OmsOrderOperateHistory> historyList = ids.stream().map(orderId -> {
+        if (count == 0) {
+            return 0;
+        }
+        List<OmsOrderOperateHistory> historyList = closableOrderIds.stream().map(orderId -> {
             OmsOrderOperateHistory history = new OmsOrderOperateHistory();
             history.setOrderId(orderId);
             history.setCreateTime(new Date());
             history.setOperateMan("后台管理员");
-            history.setOrderStatus(4);
+            history.setOrderStatus(OrderStatus.CLOSED.getValue());
             history.setNote("订单关闭:"+note);
             return history;
         }).collect(Collectors.toList());
-        orderOperateHistoryDao.insertList(historyList);
+        if (!historyList.isEmpty()) {
+            orderOperateHistoryDao.insertList(historyList);
+        }
         return count;
     }
 
@@ -149,5 +179,16 @@ public class OmsOrderServiceImpl implements OmsOrderService {
         history.setNote("修改备注信息："+note);
         orderOperateHistoryMapper.insert(history);
         return count;
+    }
+
+    private Set<Long> selectOrderIdsByStatus(List<Long> orderIds, Integer status) {
+        OmsOrderExample example = new OmsOrderExample();
+        example.createCriteria()
+                .andDeleteStatusEqualTo(0)
+                .andIdIn(orderIds)
+                .andStatusEqualTo(status);
+        return orderMapper.selectByExample(example).stream()
+                .map(OmsOrder::getId)
+                .collect(Collectors.toSet());
     }
 }
