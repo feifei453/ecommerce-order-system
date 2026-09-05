@@ -1,249 +1,221 @@
 # 电商订单交易系统
 
-本项目基于开源项目 [`macrozheng/mall`](https://github.com/macrozheng/mall) 的 `dev-v2` 分支进行学习型二次开发，重点强化订单交易主链路，并提供面向 RAG 客服 Agent 的业务工具 API。
+一个围绕电商订单主链路进行强化的 Java 后端项目，覆盖订单创建、库存锁定、支付回调、超时取消、发货、收货、售后审核以及客服 Agent 查询。
 
-## 二次开发内容
+本仓库基于 [macrozheng/mall](https://github.com/macrozheng/mall) 的 `dev-v2` 分支进行学习型二次开发。基础商城模块来自上游项目，本仓库重点展示订单交易链路的改造过程和新增功能，不将上游代码宣称为个人原创。
 
-- 使用订单状态机约束支付、发货、收货、取消、关闭等状态流转。
-- 使用 Redis `SETNX + TTL` 和请求业务指纹防止订单重复提交。
-- 使用条件更新实现支付回调幂等，避免重复扣减库存。
-- 使用 RabbitMQ 延迟队列实现订单超时关闭，并补充库存释放和操作日志追踪。
-- 增加 SKU 库存锁定状态、订单超时取消链路等验证接口。
-- 增加售后退货审核状态机以及通过、拒绝、完成接口。
-- 提供订单、物流、售后和聚合上下文等客服 Agent 工具 API。
-- 提供本地 Docker Compose 编排，隔离 MySQL、Redis、RabbitMQ、MongoDB 和 MinIO 端口。
+## 项目要解决的问题
 
-## 核心链路
+普通的订单增删改查不足以体现交易系统的业务约束。本项目围绕以下问题进行改造：
+
+- 用户连续点击提交按钮时，如何避免生成重复订单？
+- 支付平台重复发送回调时，如何避免重复扣减库存？
+- 待付款订单到期后，如何自动关闭并释放锁定库存？
+- 发货、收货、关闭和售后状态如何避免非法跳转？
+- 如何追踪一笔订单从创建到关闭的完整操作过程？
+- 智能客服如何以标准工具接口查询订单、物流和售后信息？
+
+## 系统结构
+
+```mermaid
+flowchart LR
+    Client[商城客户端] --> Portal[mall-portal<br/>交易接口]
+    Admin[运营后台] --> AdminApi[mall-admin<br/>管理接口]
+    Agent[RAG 客服 Agent] --> ToolApi[Agent Tool API]
+    ToolApi --> Portal
+    Portal --> MySQL[(MySQL)]
+    Portal --> Redis[(Redis)]
+    Portal --> RabbitMQ[(RabbitMQ)]
+    Portal --> MongoDB[(MongoDB)]
+    AdminApi --> MySQL
+    AdminApi --> Redis
+```
+
+核心服务：
+
+| 模块 | 作用 | 本地端口 |
+| --- | --- | --- |
+| `mall-portal` | 下单、支付、取消、收货以及 Agent 工具接口 | 8085 |
+| `mall-admin` | 发货、关闭订单和售后审核 | 8081 |
+| MySQL | 订单、商品、库存、售后等业务数据 | 3307 |
+| Redis | 订单提交防重和缓存 | 6381 |
+| RabbitMQ | 订单超时取消延迟消息 | 5673 / 15673 |
+| MongoDB | 浏览记录等非核心数据 | 27018 |
+| MinIO | 本地对象存储 | 9091 / 9002 |
+
+## 本仓库的二次开发
+
+### 1. 订单状态机
+
+新增 `OrderStatus` 枚举集中维护订单状态和流转规则，业务代码不再到处直接比较魔法数字。
 
 ```text
-提交订单 -> Redis 防重 -> 校验库存 -> 锁定库存 -> 创建待付款订单
-         -> RabbitMQ 延迟消息 -> 超时关闭订单 -> 释放锁定库存
-         -> 支付成功回调 -> 条件更新保证幂等 -> 扣减库存 -> 待发货
+待付款(0) --支付成功--> 待发货(1) --后台发货--> 已发货(2)
+    |                                          |
+    +--用户取消/超时关闭--> 已关闭(4)           +--确认收货--> 已完成(3)
 ```
 
-客服 Agent 联动链路：
+主要约束：
+
+- 只有待付款订单可以支付或取消。
+- 只有待发货订单可以发货。
+- 只有已发货订单可以确认收货。
+- 只有已完成或已关闭订单可以由用户删除。
+- 每次关键状态变化都写入 `oms_order_operate_history`。
+
+### 2. 订单创建防重复提交
+
+订单创建入口根据会员、地址、优惠券、积分、支付方式和购物车条目生成 SHA-256 业务指纹，并使用 Redis：
 
 ```text
-RAG 客服 -> Agent 工具调用 -> /agent-tools/** -> 订单/物流/售后数据 -> 生成客服回答
+SETNX mall:oms:orderSubmitLock:{memberId}:{fingerprint} value EX 10
 ```
 
-## 快速开始
+首次请求成功获得短期锁并继续创建订单；相同参数在锁有效期内再次提交时直接返回“订单正在提交”，避免重复订单。
 
-- 本地环境搭建与启动：[LOCAL_RUN.md](./LOCAL_RUN.md)
-- 二次开发范围及接口说明：[PROJECT_PLAN.md](./PROJECT_PLAN.md)
-- `mall-admin` Swagger：`http://127.0.0.1:8081/swagger-ui/`
-- `mall-portal` Swagger：`http://127.0.0.1:8085/swagger-ui/`
+### 3. 支付回调幂等
 
-## 项目说明
+支付成功不是“先查状态再无条件更新”，而是使用带旧状态条件的数据库更新：
 
-仓库保留上游项目的 Git 提交历史和原始文档。上述“二次开发内容”为本仓库新增或改造的部分，其余基础商城功能及版权归原项目作者所有。详细许可条件请参见仓库中的 `LICENSE`。
-
----
-
-# 上游项目说明：mall
-
-<p>
-  <a href="#公众号"><img src="http://macro-oss.oss-cn-shenzhen.aliyuncs.com/mall/badge/%E5%85%AC%E4%BC%97%E5%8F%B7-macrozheng-blue.svg" alt="公众号"></a>
-  <a href="#公众号"><img src="http://macro-oss.oss-cn-shenzhen.aliyuncs.com/mall/badge/%E4%BA%A4%E6%B5%81-%E5%BE%AE%E4%BF%A1%E7%BE%A4-2BA245.svg" alt="交流"></a>
-  <a href="https://github.com/macrozheng/mall-learning"><img src="http://macro-oss.oss-cn-shenzhen.aliyuncs.com/mall/badge/%E5%AD%A6%E4%B9%A0%E6%95%99%E7%A8%8B-mall--learning-green.svg" alt="学习教程"></a>
-  <a href="https://github.com/macrozheng/mall-swarm"><img src="http://macro-oss.oss-cn-shenzhen.aliyuncs.com/mall/badge/Cloud%E7%89%88%E6%9C%AC-mall--swarm-brightgreen.svg" alt="SpringCloud版本"></a>
-  <a href="https://github.com/macrozheng/mall-admin-web"><img src="https://macro-oss.oss-cn-shenzhen.aliyuncs.com/mall/badge/%E5%90%8E%E5%8F%B0%E7%AE%A1%E7%90%86%E7%B3%BB%E7%BB%9F-mall--admin--web-green.svg" alt="后台管理系统"></a>
-  <a href="https://github.com/macrozheng/mall-app-web"><img src="https://macro-oss.oss-cn-shenzhen.aliyuncs.com/mall/badge/%E5%89%8D%E5%8F%B0%E5%95%86%E5%9F%8E%E9%A1%B9%E7%9B%AE-mall--app--web-green.svg" alt="前台商城项目"></a>
-  <a href="https://gitee.com/macrozheng/mall"><img src="http://macro-oss.oss-cn-shenzhen.aliyuncs.com/mall/badge/%E7%A0%81%E4%BA%91-%E9%A1%B9%E7%9B%AE%E5%9C%B0%E5%9D%80-orange.svg" alt="码云"></a>
-</p>
-
-## 友情提示
-
-> 1. **快速体验项目**：[在线访问地址](https://www.macrozheng.com/admin/index.html) 。
-> 2. **全套学习教程**：[《mall学习教程》](https://www.macrozheng.com) 。
-> 3. **视频教程**：[《mall视频教程》](https://www.macrozheng.com/mall/foreword/mall_video.html) 。
-> 4. **微服务版本**：基于Spring Cloud Alibaba的项目：[mall-swarm](https://github.com/macrozheng/mall-swarm) 。
-> 5. **分支说明**：`master`分支基于Spring Boot 2.7+JDK 8，`dev-v3`分支基于Spring Boot 3.2+JDK 17。
-
-## 前言
-
-`mall`项目致力于打造一个完整的电商系统，采用现阶段主流技术实现。
-
-## 项目文档
-
-文档地址：[https://www.macrozheng.com](https://www.macrozheng.com)
-
-## 项目介绍
-
-`mall`项目是一套电商系统，包括前台商城系统及后台管理系统，基于SpringBoot+MyBatis实现，采用Docker容器化部署。前台商城系统包含首页门户、商品推荐、商品搜索、商品展示、购物车、订单流程、会员中心、客户服务、帮助中心等模块。后台管理系统包含商品管理、订单管理、会员管理、促销管理、运营管理、内容管理、统计报表、财务管理、权限管理、设置等模块。
-
-### 项目演示
-
-#### 后台管理系统
-
-前端项目`mall-admin-web`地址：https://github.com/macrozheng/mall-admin-web
-
-项目演示地址： [https://www.macrozheng.com/admin/index.html](https://www.macrozheng.com/admin/index.html)  
-
-![后台管理系统功能演示](./document/resource/mall_admin_show.png)
-
-#### 前台商城系统
-
-前端项目`mall-app-web`地址：https://github.com/macrozheng/mall-app-web
-
-项目演示地址（将浏览器切换为手机模式效果更佳）：[https://www.macrozheng.com/app/](https://www.macrozheng.com/app/)
-
-![前台商城系统功能演示](./document/resource/re_mall_app_show.jpg)
-
-### 组织结构
-
-``` lua
-mall
-├── mall-common -- 工具类及通用代码
-├── mall-mbg -- MyBatisGenerator生成的数据库操作代码
-├── mall-security -- SpringSecurity封装公用模块
-├── mall-admin -- 后台商城管理系统接口
-├── mall-search -- 基于Elasticsearch的商品搜索系统
-├── mall-portal -- 前台商城系统接口
-└── mall-demo -- 框架搭建时的测试代码
+```sql
+UPDATE oms_order
+SET status = 1, payment_time = ?
+WHERE id = ? AND status = 0 AND delete_status = 0;
 ```
 
-### 技术选型
+只有一个回调能够把订单从待付款更新为待发货。重复回调发现订单已经处于待发货状态时直接按成功处理，不重复扣减真实库存。
 
-#### 后端技术
+### 4. 库存锁定与释放
 
-| 技术                 | 说明                | 官网                                           |
-| -------------------- | ------------------- | ---------------------------------------------- |
-| SpringBoot           | Web应用开发框架      | https://spring.io/projects/spring-boot         |
-| SpringSecurity       | 认证和授权框架      | https://spring.io/projects/spring-security     |
-| MyBatis              | ORM框架             | http://www.mybatis.org/mybatis-3/zh/index.html |
-| MyBatisGenerator     | 数据层代码生成器     | http://www.mybatis.org/generator/index.html    |
-| Elasticsearch        | 搜索引擎            | https://github.com/elastic/elasticsearch       |
-| RabbitMQ             | 消息队列            | https://www.rabbitmq.com/                      |
-| Redis                | 内存数据存储         | https://redis.io/                              |
-| MongoDB              | NoSql数据库         | https://www.mongodb.com                        |
-| LogStash             | 日志收集工具        | https://github.com/elastic/logstash            |
-| Kibana               | 日志可视化查看工具  | https://github.com/elastic/kibana              |
-| Nginx                | 静态资源服务器      | https://www.nginx.com/                         |
-| Docker               | 应用容器引擎        | https://www.docker.com                         |
-| Jenkins              | 自动化部署工具      | https://github.com/jenkinsci/jenkins           |
-| Druid                | 数据库连接池        | https://github.com/alibaba/druid               |
-| OSS                  | 对象存储            | https://github.com/aliyun/aliyun-oss-java-sdk  |
-| MinIO                | 对象存储            | https://github.com/minio/minio                 |
-| JWT                  | JWT登录支持         | https://github.com/jwtk/jjwt                   |
-| Lombok               | Java语言增强库      | https://github.com/rzwitserloot/lombok         |
-| Hutool               | Java工具类库        | https://github.com/looly/hutool                |
-| PageHelper           | MyBatis物理分页插件 | http://git.oschina.net/free/Mybatis_PageHelper |
-| Swagger-UI           | API文档生成工具      | https://github.com/swagger-api/swagger-ui      |
-| Hibernator-Validator | 验证框架            | http://hibernate.org/validator                 |
+```text
+创建订单：lock_stock 增加
+支付成功：stock 扣减，lock_stock 释放
+取消订单：lock_stock 释放
+超时关闭：lock_stock 释放
+```
 
-#### 前端技术
+新增 `GET /order/stockLockStatus/{orderId}`，用于查看订单关联 SKU 的总库存、锁定库存和可售库存，便于演示和排查库存链路。
 
-| 技术       | 说明                  | 官网                                   |
-| ---------- | --------------------- | -------------------------------------- |
-| Vue        | 前端框架              | https://vuejs.org/                     |
-| Vue-router | 路由框架              | https://router.vuejs.org/              |
-| Vuex       | 全局状态管理框架      | https://vuex.vuejs.org/                |
-| Element    | 前端UI框架            | https://element.eleme.io               |
-| Axios      | 前端HTTP框架          | https://github.com/axios/axios         |
-| v-charts   | 基于Echarts的图表框架 | https://v-charts.js.org/               |
-| Js-cookie  | cookie管理工具        | https://github.com/js-cookie/js-cookie |
-| nprogress  | 进度条控件            | https://github.com/rstacruz/nprogress  |
+### 5. RabbitMQ 超时取消
 
-#### 移动端技术
+订单创建后发送带过期时间的消息到 TTL 队列。消息到期后经死信交换机进入取消队列，由消费者关闭仍处于待付款状态的订单。
 
-| 技术         | 说明             | 官网                                    |
-| ------------ | ---------------- | --------------------------------------- |
-| Vue          | 核心前端框架     | https://vuejs.org                       |
-| Vuex         | 全局状态管理框架 | https://vuex.vuejs.org                  |
-| uni-app      | 移动端前端框架   | https://uniapp.dcloud.io                |
-| mix-mall     | 电商项目模板     | https://ext.dcloud.net.cn/plugin?id=200 |
-| luch-request | HTTP请求框架     | https://github.com/lei-mu/luch-request  |
+```mermaid
+sequenceDiagram
+    participant O as 订单服务
+    participant T as TTL 队列
+    participant C as 取消队列
+    participant D as MySQL
+    O->>T: 发送 orderId 和延迟时间
+    T-->>C: 消息到期后死信转发
+    C->>D: 条件检查待付款状态
+    C->>D: 关闭订单并释放锁定库存
+```
 
-#### 架构图
+项目提供手动发送和聚合追踪接口，可以用较短延迟验证整条链路，而不必等待真实业务超时时间。
 
-##### 系统架构图
+### 6. 售后审核状态机
 
-![系统架构图](./document/resource/re_mall_system_arch.jpg)
+```text
+待处理(0) --审核通过--> 退货中(1) --确认完成--> 已完成(2)
+    |
+    +--审核拒绝--> 已拒绝(3)
+```
 
-##### 业务架构图
+后台新增审核通过、拒绝和完成接口。非法状态跳转会被拒绝，审核结果同时写入订单操作日志；退货完成后同步关闭关联订单。
 
-![业务架构图](./document/resource/re_mall_business_arch.jpg)
+### 7. 客服 Agent 工具 API
 
-#### 模块介绍
+`mall-portal` 对外提供只读工具接口，供 RAG 客服项目调用：
 
-##### 后台管理系统 `mall-admin`
+| 方法 | 接口 | 用途 |
+| --- | --- | --- |
+| GET | `/agent-tools/orders/{orderSn}` | 按订单号查询订单、商品和操作日志 |
+| GET | `/agent-tools/orders/id/{orderId}` | 按订单 ID 查询详情 |
+| GET | `/agent-tools/orders/{orderSn}/logistics` | 查询发货和物流信息 |
+| GET | `/agent-tools/orders/{orderSn}/return-applies` | 查询关联售后申请 |
+| GET | `/agent-tools/orders/{orderSn}/context` | 聚合订单、物流和售后上下文 |
 
-- 商品管理：[功能结构图-商品.jpg](document/resource/mind_product.jpg)
-- 订单管理：[功能结构图-订单.jpg](document/resource/mind_order.jpg)
-- 促销管理：[功能结构图-促销.jpg](document/resource/mind_sale.jpg)
-- 内容管理：[功能结构图-内容.jpg](document/resource/mind_content.jpg)
-- 用户管理：[功能结构图-用户.jpg](document/resource/mind_member.jpg)
+这些接口将底层数据库模型转换为适合 Agent 消费的结构化结果，避免大模型直接访问数据库。
 
-##### 前台商城系统 `mall-portal`
+## 技术栈
 
-[功能结构图-前台.jpg](document/resource/mind_portal.jpg)
+- Java 8、Spring Boot 2.7
+- Spring Security、JWT
+- MyBatis、MyBatis Generator、MySQL 5.7
+- Redis
+- RabbitMQ
+- MongoDB
+- Swagger UI
+- Docker Compose、Maven
 
-#### 开发进度
+## 快速启动
 
-![项目开发进度图](./document/resource/re_mall_dev_flow.jpg)
+环境要求：JDK 8、Maven、Docker Desktop，并启用 WSL 2 后端。
 
-## 环境搭建
+### 1. 启动基础设施
 
-### 开发工具
+PowerShell：
 
-| 工具          | 说明                | 官网                                            |
-| ------------- | ------------------- | ----------------------------------------------- |
-| IDEA          | 开发IDE             | https://www.jetbrains.com/idea/download         |
-| RedisDesktop  | redis客户端连接工具 | https://github.com/qishibo/AnotherRedisDesktopManager  |
-| Robomongo     | mongo客户端连接工具 | https://robomongo.org/download                  |
-| SwitchHosts   | 本地host管理        | https://oldj.github.io/SwitchHosts/             |
-| X-shell       | Linux远程连接工具   | http://www.netsarang.com/download/software.html |
-| Navicat       | 数据库连接工具      | http://www.formysql.com/xiazai.html             |
-| PowerDesigner | 数据库设计工具      | http://powerdesigner.de/                        |
-| Axure         | 原型设计工具        | https://www.axure.com/                          |
-| MindMaster    | 思维导图设计工具    | http://www.edrawsoft.cn/mindmaster              |
-| ScreenToGif   | gif录制工具         | https://www.screentogif.com/                    |
-| ProcessOn     | 流程图绘制工具      | https://www.processon.com/                      |
-| PicPick       | 图片处理工具        | https://picpick.app/zh/                         |
-| Snipaste      | 屏幕截图工具        | https://www.snipaste.com/                       |
-| Postman       | API接口调试工具      | https://www.postman.com/                        |
-| Typora        | Markdown编辑器      | https://typora.io/                              |
+```powershell
+Copy-Item .env.local.example .env.local
+.\scripts\start-local-infra.ps1
+```
 
-### 开发环境
+WSL：
 
-| 工具          | 版本号 | 下载                                                         |
-| ------------- | ------ | ------------------------------------------------------------ |
-| JDK           | 1.8    | https://www.oracle.com/technetwork/java/javase/downloads/jdk8-downloads-2133151.html |
-| MySQL         | 5.7    | https://www.mysql.com/                                       |
-| Redis         | 7.0    | https://redis.io/download                                    |
-| MongoDB       | 5.0    | https://www.mongodb.com/download-center                      |
-| RabbitMQ      | 3.10.5 | http://www.rabbitmq.com/download.html                        |
-| Nginx         | 1.22   | http://nginx.org/en/download.html                            |
-| Elasticsearch | 7.17.3 | https://www.elastic.co/downloads/elasticsearch               |
-| Logstash      | 7.17.3 | https://www.elastic.co/cn/downloads/logstash                 |
-| Kibana        | 7.17.3 | https://www.elastic.co/cn/downloads/kibana                   |
+```bash
+cp .env.local.example .env.local
+docker compose --env-file .env.local -f docker-compose.local.yml up -d
+```
 
-### 搭建步骤
+### 2. 打包服务
 
-> Windows环境部署
+```powershell
+mvn -pl mall-admin,mall-portal -am -DskipTests package
+```
 
-- Windows环境搭建请参考：[mall项目后端开发环境搭建](https://www.macrozheng.com/mall/start/mall_deploy_windows.html);
-- 注意：如果只启动`mall-admin`模块，仅需安装MySQL、Redis即可;
-- 克隆`mall-admin-web`项目，并导入到IDEA中完成编译：[前端项目地址](https://github.com/macrozheng/mall-admin-web);
-- `mall-admin-web`项目的安装及部署请参考：[mall项目前端发环境搭建](https://www.macrozheng.com/mall/start/mall_deploy_web.html) 。
+项目内的 `.mvn/maven.config` 已跳过原项目 Docker 镜像构建，并将 Maven 本地仓库放在项目目录中。
 
-> Docker环境部署
+### 3. 启动应用
 
-- 使用虚拟机安装CentOS7.6请参考：[虚拟机安装及使用Linux，看这一篇就够了](https://www.macrozheng.com/mall/deploy/linux_install.html);
-- 本项目Docker镜像构建请参考：[使用Maven插件为SpringBoot应用构建Docker镜像](https://www.macrozheng.com/project/maven_docker_fabric8.html);
-- 本项目在Docker容器下的部署请参考：[mall在Linux环境下的部署（基于Docker容器）](https://www.macrozheng.com/mall/deploy/mall_deploy_docker.html);
-- 本项目使用Docker Compose请参考： [mall在Linux环境下的部署（基于Docker Compose）](https://www.macrozheng.com/mall/deploy/mall_deploy_docker_compose.html);
-- 本项目在Linux下的自动化部署请参考：[mall在Linux环境下的自动化部署（基于Jenkins）](https://www.macrozheng.com/mall/deploy/mall_deploy_jenkins.html);
+```powershell
+java -jar mall-admin\target\mall-admin-1.0-SNAPSHOT.jar --spring.profiles.active=local
+java -jar mall-portal\target\mall-portal-1.0-SNAPSHOT.jar --spring.profiles.active=local
+```
 
-## 公众号
+访问地址：
 
-加微信群交流，关注公众号「**macrozheng**」，回复「**加群**」即可。
+- 后台 Swagger：<http://127.0.0.1:8081/swagger-ui/>
+- 商城 Swagger：<http://127.0.0.1:8085/swagger-ui/>
+- RabbitMQ 控制台：<http://127.0.0.1:15673/>
 
-![公众号图片](./document/resource/qrcode_for_macrozheng_258.jpg)
+更完整的环境说明见 [LOCAL_RUN.md](./LOCAL_RUN.md)，功能与验证步骤见 [PROJECT_PLAN.md](./PROJECT_PLAN.md)。
 
-## 许可证
+## 代码阅读入口
 
-[Apache License 2.0](https://github.com/macrozheng/mall/blob/master/LICENSE)
+| 主题 | 代码位置 |
+| --- | --- |
+| 订单状态机 | `mall-common/.../enums/OrderStatus.java` |
+| 售后状态机 | `mall-common/.../enums/ReturnApplyStatus.java` |
+| 下单、防重、支付和取消 | `mall-portal/.../service/impl/OmsPortalOrderServiceImpl.java` |
+| 延迟消息消费者 | `mall-portal/.../component/CancelOrderReceiver.java` |
+| 库存和超时追踪接口 | `mall-portal/.../controller/OmsPortalOrderController.java` |
+| 客服工具接口 | `mall-portal/.../controller/AgentOrderToolController.java` |
+| 客服工具数据聚合 | `mall-portal/.../service/impl/AgentOrderToolServiceImpl.java` |
+| 后台发货和关闭 | `mall-admin/.../service/impl/OmsOrderServiceImpl.java` |
+| 售后审核 | `mall-admin/.../service/impl/OmsOrderReturnApplyServiceImpl.java` |
 
-Copyright (c) 2018-2026 macrozheng
+## 当前边界
+
+- 项目重点是 Java 后端交易链路，前端管理页面不包含在本仓库中。
+- 支付使用回调模拟接口，未配置真实商户密钥。
+- 物流结果来自订单发货字段和业务提示，未接入第三方物流平台。
+- 防重复提交解决短时间相同请求重复进入，不等同于完整的分布式事务方案。
+- 目前以功能链路验证为主，没有宣称未经压测的数据或并发指标。
+
+## 上游与许可
+
+基础项目来源：[macrozheng/mall](https://github.com/macrozheng/mall)。
+
+仓库保留上游 Git 历史，便于区分基础代码与本次二次开发提交。本项目继续遵循上游仓库的 Apache License 2.0，详见 [LICENSE](./LICENSE)。
